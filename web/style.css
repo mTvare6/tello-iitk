@@ -1,0 +1,137 @@
+:root {
+    color-scheme: dark;
+    --bg: #0f141e;
+    --ink: #dee7f2;
+    --edge: #394a60;
+    --gold: #facf70;
+    --cyan: #63dae9;
+    font-family: "DejaVu Sans Mono", "Liberation Mono", "Courier New", monospace;
+    font-size: 14px;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--ink);
+}
+
+body {
+    display: flex;
+    flex-direction: column;
+    padding: 0 1px env(safe-area-inset-bottom);
+}
+
+#terminal {
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+    outline: none;
+    touch-action: manipulation;
+}
+
+#screen {
+    display: block;
+}
+
+#keys {
+    flex: none;
+    display: flex;
+    flex-wrap: wrap;
+    align-content: flex-start;
+    gap: 0;
+    font: inherit;
+    line-height: 20px;
+    padding: 0;
+}
+
+.hint {
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
+    margin-right: 2ch;
+}
+
+.key {
+    border: 0;
+    border-radius: 0;
+    background: var(--edge);
+    color: var(--gold);
+    font: inherit;
+    font-weight: bold;
+    line-height: 20px;
+    padding: 0 1ch;
+    cursor: pointer;
+}
+
+.key + .key {
+    border-left: 1px solid var(--bg);
+}
+
+.key:hover,
+.key:focus-visible {
+    color: var(--bg);
+    background: var(--gold);
+    outline: none;
+}
+
+.action {
+    padding-left: 1ch;
+}
+
+#keys > a {
+    color: var(--gold);
+    margin-right: 2ch;
+    line-height: 20px;
+}
+
+#input {
+    position: fixed;
+    left: 1px;
+    bottom: 0;
+    opacity: 0;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    border: 0;
+    font-size: 16px;
+    resize: none;
+    pointer-events: none;
+}
+
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: pre;
+    border: 0;
+}
+
+@media (pointer: coarse) {
+    #keys {
+        padding: 2px 0;
+        row-gap: 3px;
+    }
+    .hint {
+        margin-right: 1ch;
+    }
+    .key {
+        min-height: 34px;
+        padding: 0 0.65ch;
+    }
+    .action {
+        padding-left: 0.5ch;
+    }
+}
