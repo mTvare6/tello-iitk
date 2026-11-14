@@ -58,6 +58,7 @@ enum Completed {
     Authenticated(Api),
 
     LoginForm(Box<login::Challenge>, Option<&'static str>),
+    Suggestion(Option<String>),
 }
 
 #[derive(Clone, Debug)]
@@ -155,7 +156,7 @@ struct App {
     pending_g: bool,
     download_dir: PathBuf,
     pending: Option<tokio::task::JoinHandle<()>>,
-
+    solver: Option<tokio::task::JoinHandle<()>>,
     downloader: Option<tokio::task::JoinHandle<()>>,
     downloading: bool,
 
@@ -223,7 +224,7 @@ impl App {
             authenticating: false,
             login_form: None,
             login_fields,
-            show_captcha: true,
+            show_captcha: false,
             nav: Navigation::default(),
             busy: false,
             status,
@@ -238,7 +239,7 @@ impl App {
             pending_g: false,
             download_dir,
             pending: None,
-
+            solver: None,
             downloader: None,
             downloading: false,
 
@@ -337,6 +338,10 @@ impl App {
     }
 
     fn cancel_pending(&mut self) -> bool {
+        if let Some(solver) = self.solver.take() {
+            solver.abort();
+        }
+
         if let Some(task) = self.pending.take() {
             task.abort();
             self.generation += 1;
@@ -352,6 +357,10 @@ impl App {
     fn prepare_login(&mut self) {
         if self.busy {
             return;
+        }
+
+        if let Some(solver) = self.solver.take() {
+            solver.abort();
         }
 
         self.cancel_downloads();
@@ -416,9 +425,18 @@ impl App {
         if self.login_form.as_ref().is_some_and(|f| f.has_captcha())
             && self.login_fields.captcha.is_empty()
         {
+            if self.solver.is_some() {
+                self.message("Reading login challenge…", false);
+
+                return;
+            }
+
             self.show_captcha = true;
             self.login_fields.focus = 2;
-            self.message("Enter the CAPTCHA characters or F2 for a new image.", true);
+            self.message(
+                "Could not read CAPTCHA. Enter the characters or F2 for a new image.",
+                true,
+            );
 
             return;
         }
@@ -428,6 +446,10 @@ impl App {
 
             return;
         };
+
+        if let Some(solver) = self.solver.take() {
+            solver.abort();
+        }
 
         let credentials = self.login_fields.take();
         let session = self.session.clone();
@@ -574,13 +596,52 @@ impl App {
             return;
         }
 
+        if let Ok(Completed::Suggestion(code)) = &result {
+            let active = self.solver.take().is_some();
+
+            if active
+                && self.login_screen
+                && !self.authenticating
+                && self.login_form.is_some()
+                && self.login_fields.captcha.is_empty()
+            {
+                if let Some(code) = code {
+                    self.login_fields.set_captcha(code.clone());
+
+                    if !self.status_error {
+                        self.message(
+                            if self.show_captcha {
+                                "Check the suggested code."
+                            } else {
+                                ""
+                            },
+                            false,
+                        );
+                    }
+                } else {
+                    self.show_captcha = true;
+
+                    if self.login_fields.focus == 3 {
+                        self.login_fields.focus = 2;
+                    }
+
+                    self.message(
+                        "Could not read CAPTCHA. Enter the characters or F2 for a new image.",
+                        true,
+                    );
+                }
+            }
+
+            return;
+        }
+
         self.busy = false;
         self.authenticating = false;
         self.pending = None;
 
         match result {
             Ok(Completed::Authenticated(api)) => {
-                self.show_captcha = true;
+                self.show_captcha = false;
                 self.page_cache.clear();
                 self.login_fields.clear_secrets();
                 self.login_form = None;
@@ -603,8 +664,10 @@ impl App {
                 } else {
                     self.message("", false);
                 }
-            }
 
+                self.suggest_code();
+            }
+            Ok(Completed::Suggestion(_)) => {}
             Ok(Completed::Page(location, page, replace)) => {
                 self.page_cache.insert(location.clone(), page.clone());
 
@@ -630,7 +693,7 @@ impl App {
                     self.cancel_downloads();
                     self.page_cache.clear();
                     self.api = None;
-                    self.show_captcha = true;
+                    self.show_captcha = false;
                     self.nav = Navigation::default();
                     self.login_screen = true;
                     self.needs_login_form = true;
@@ -642,6 +705,27 @@ impl App {
                 }
             }
         }
+    }
+
+    fn suggest_code(&mut self) {
+        if self.authenticating {
+            return;
+        }
+
+        let Some(image) = self.login_form.as_ref().and_then(|f| f.ocr_image()) else {
+            return;
+        };
+
+        if let Some(solver) = self.solver.take() {
+            solver.abort();
+        }
+
+        let generation = self.generation;
+        let tx = self.tx.clone();
+        self.solver = Some(tokio::spawn(async move {
+            let code = crate::ocr::suggest_code(image).await.map(|p| p.text);
+            let _ = tx.send((generation, Ok(Completed::Suggestion(code))));
+        }));
     }
 
     fn back(&mut self) {
@@ -1034,6 +1118,10 @@ impl App {
                     }
                 }
 
+                KeyCode::F(5) if !self.authenticating => {
+                    self.login_fields.set_captcha(String::new());
+                    self.suggest_code();
+                }
                 KeyCode::Tab | KeyCode::Down if !self.authenticating => {
                     self.move_login_focus(false);
                 }
@@ -1177,7 +1265,7 @@ impl App {
                 self.help_scroll = 0;
             }
             KeyCode::Char('L') if !self.busy => {
-                self.show_captcha = true;
+                self.show_captcha = false;
                 self.login_fields.clear_secrets();
                 self.login_fields.focus = 0;
                 self.prepare_login();
@@ -2194,7 +2282,7 @@ fn hint_lines(hints: &[Hint], width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-const HELP: &str = "↑ / ↓ or j / k    Move / scroll focused pane\nEnter / → / l    Open selected item\n← / h / b        Back\n/                Filter; Enter finishes, Esc clears\nf                Jump: type a row label, then Enter to open\ngg / G           First / last\nTab              Switch text / files\nPgUp / PgDn      Scroll a page\nd                Download selected branch; focused text: all files here\nx                Cancel download\nr                Refresh\nL                Sign in\nq / Ctrl-C       Quit\n\nLogin\nTab / Shift-Tab / ↑↓   Change field\nEnter            Next field / sign in\n← / →            Move caret\nHome / End       Start / end of field\nDelete / Backspace   Delete at / before caret\nF2               New CAPTCHA\nF4               Enlarge CAPTCHA\nEsc              Cancel and clear password\nCtrl-C           Quit\n\nEsc / ? / F1     Close help";
+const HELP: &str = "↑ / ↓ or j / k    Move / scroll focused pane\nEnter / → / l    Open selected item\n← / h / b        Back\n/                Filter; Enter finishes, Esc clears\nf                Jump: type a row label, then Enter to open\ngg / G           First / last\nTab              Switch text / files\nPgUp / PgDn      Scroll a page\nd                Download selected branch; focused text: all files here\nx                Cancel download\nr                Refresh\nL                Sign in\nq / Ctrl-C       Quit\n\nLogin\nTab / Shift-Tab / ↑↓   Change field\nEnter            Next field / sign in\n← / →            Move caret\nHome / End       Start / end of field\nDelete / Backspace   Delete at / before caret\nF2               New CAPTCHA\nF4               Enlarge CAPTCHA\nF5               Suggest code with local OCR\nEsc              Cancel and clear password\nCtrl-C           Quit\n\nEsc / ? / F1     Close help";
 
 pub async fn run(session: PathBuf, download_dir: PathBuf) -> Result<()> {
     run_mode(session, download_dir, false).await
@@ -2423,7 +2511,7 @@ impl BrowserApp {
             "F1" => KeyCode::F(1),
             "F2" => KeyCode::F(2),
             "F4" => KeyCode::F(4),
-
+            "F5" => KeyCode::F(5),
             s if s.chars().count() == 1 => KeyCode::Char(s.chars().next().unwrap()),
             _ => return false,
         };

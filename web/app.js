@@ -409,6 +409,7 @@ document.addEventListener("keydown", (event) => {
         "F1",
         "F2",
         "F4",
+        "F5",
     ];
 
     if (Array.from(event.key).length === 1 || special.includes(event.key)) {
