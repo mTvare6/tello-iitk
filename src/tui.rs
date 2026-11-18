@@ -4,6 +4,7 @@ use crate::{
     model::*,
     navigation::Navigation,
     text::{Cursor, Edit},
+    tracking,
 };
 use anyhow::Result;
 use crossterm::event::{
@@ -56,6 +57,8 @@ enum Completed {
         result: Result<Page>,
     },
     Authenticated(Api),
+    Restored(Vec<crate::navigation::View>, Option<String>),
+    Tracking(Result<()>),
 
     LoginForm(Box<login::Challenge>, Option<&'static str>),
     Suggestion(Option<String>),
@@ -130,7 +133,11 @@ pub(crate) enum BrowserEffect {
 
 struct App {
     browser: bool,
+    tracker: Option<tracking::Tracker>,
+    home_requested: bool,
 
+    notice: String,
+    notice_error: bool,
     browser_files: Vec<PathBuf>,
     browser_effects: Vec<BrowserEffect>,
     login_hitboxes: Vec<(Rect, usize)>,
@@ -159,7 +166,7 @@ struct App {
     solver: Option<tokio::task::JoinHandle<()>>,
     downloader: Option<tokio::task::JoinHandle<()>>,
     downloading: bool,
-
+    opening_read: Option<String>,
     download_id: u64,
     download_status: String,
     page_cache: std::collections::HashMap<Location, Page>,
@@ -211,9 +218,13 @@ impl App {
 
         login_fields.cursors[0].position = login_fields.username.chars().count();
 
-        Self {
+        let mut app = Self {
             browser: false,
+            tracker: None,
+            home_requested: false,
 
+            notice: String::new(),
+            notice_error: false,
             browser_files: Vec::new(),
             browser_effects: Vec::new(),
             login_hitboxes: Vec::new(),
@@ -242,7 +253,7 @@ impl App {
             solver: None,
             downloader: None,
             downloading: false,
-
+            opening_read: None,
             download_id: 0,
             download_status: String::new(),
             page_cache: Default::default(),
@@ -263,6 +274,28 @@ impl App {
             list_state: ListState::default(),
             visible_rows: Vec::new(),
             list_hitboxes: Vec::new(),
+        };
+
+        app.attach_tracker();
+
+        app
+    }
+
+    fn attach_tracker(&mut self) {
+        self.tracker = None;
+
+        if let Ok((uid, _)) = auth::identity(&self.session) {
+            let tx = self.tx.clone();
+
+            match tracking::Tracker::open(&uid, move |result| {
+                let _ = tx.send((0, Ok(Completed::Tracking(result))));
+            }) {
+                Ok(tracker) => self.tracker = Some(tracker),
+                Err(error) => {
+                    self.notice = format!("Browsing state unavailable: {error}");
+                    self.notice_error = true;
+                }
+            }
         }
     }
 
@@ -273,6 +306,104 @@ impl App {
 
         if let Some(view) = &mut self.nav.current {
             view.text_focus = self.text_focus;
+        }
+
+        if let Some(tracker) = &mut self.tracker {
+            tracker.remember(&self.nav);
+        }
+    }
+
+    fn start_location(&mut self) {
+        let saved = self
+            .tracker
+            .as_ref()
+            .map(|t| t.resume.clone())
+            .unwrap_or_default();
+
+        if std::mem::take(&mut self.home_requested) || saved.is_empty() {
+            self.load(Location::Catalog("/courses".into()), false);
+
+            return;
+        }
+
+        let Some(api) = self.api.clone() else {
+            return;
+        };
+        self.cancel_pending();
+        self.generation += 1;
+
+        let generation = self.generation;
+        self.busy = true;
+        self.login_screen = false;
+        self.message("Restoring location…", false);
+
+        let tx = self.tx.clone();
+        self.pending = Some(tokio::spawn(async move {
+            let result = async {
+                let mut views = Vec::new();
+                let mut warning = None;
+
+                for saved in saved {
+                    match api.load(&saved.location).await {
+                        Ok(page) => views.push(saved.apply(page)),
+                        Err(error) if error.is::<auth::AccessDenied>() => return Err(error),
+                        Err(_) => {
+                            warning =
+                                Some("Last location is unavailable; restored its parent.".into());
+                            break;
+                        }
+                    }
+                }
+
+                if views.is_empty() {
+                    views.push(crate::navigation::View::new(
+                        Location::Catalog("/courses".into()),
+                        api.load(&Location::Catalog("/courses".into())).await?,
+                    ));
+                }
+
+                Ok(Completed::Restored(views, warning))
+            }
+            .await;
+
+            let _ = tx.send((generation, result));
+        }));
+    }
+
+    fn home(&mut self) {
+        self.remember_view();
+        self.cancel_pending();
+        self.clear_preview();
+        self.help = false;
+        self.searching = false;
+        self.jump = None;
+        self.pending_g = false;
+        self.home_requested = self.api.is_none();
+
+        if let Some(tracker) = &mut self.tracker {
+            tracker.home();
+        }
+
+        self.nav = Navigation::default();
+
+        if self.api.is_some() {
+            self.load(Location::Catalog("/courses".into()), false);
+        } else {
+            self.login_screen = true;
+            self.login_fields.clear_secrets();
+            self.login_form = None;
+            self.needs_login_form = true;
+            self.busy = false;
+            self.authenticating = false;
+            self.message("Sign in to open Courses.", false);
+        }
+    }
+
+    fn mark_read(&self, action: &Action) {
+        if let Some(tracker) = &self.tracker
+            && let Some(key) = tracking::action_key(action)
+        {
+            tracker.mark_read(key);
         }
     }
 
@@ -480,6 +611,13 @@ impl App {
 
     fn complete(&mut self, generation: u64, result: Result<Completed>) {
         match result {
+            Ok(Completed::Tracking(result)) => {
+                if let Err(error) = result {
+                    self.notice = format!("Could not save browsing state: {error}");
+                    self.notice_error = true;
+                }
+            }
+
             Ok(Completed::Preview {
                 id,
                 location,
@@ -491,6 +629,10 @@ impl App {
 
                     match result {
                         Ok(page) => {
+                            if let Some(tracker) = &self.tracker {
+                                tracker.observe(&location, &page, false);
+                            }
+
                             self.page_cache.insert(location, page.clone());
                             self.preview_page = Some(page);
                             self.preview_error = None;
@@ -560,6 +702,13 @@ impl App {
                     },
                     failed > 0,
                 );
+
+                if let Some(key) = self.opening_read.take()
+                    && open.is_some()
+                    && let Some(tracker) = &self.tracker
+                {
+                    tracker.mark_read(key);
+                }
 
                 if self.browser {
                     if let Some(path) = open {
@@ -649,10 +798,27 @@ impl App {
                 self.nav = Navigation::default();
                 self.searching = false;
                 self.reset_view();
+                self.attach_tracker();
 
-                self.load(Location::Catalog("/courses".into()), false);
+                self.start_location();
             }
+            Ok(Completed::Restored(mut views, warning)) => {
+                self.nav.current = views.pop();
+                self.nav.history = views;
 
+                for view in self.nav.history.iter().chain(self.nav.current.iter()) {
+                    self.page_cache
+                        .insert(view.location.clone(), view.page.clone());
+
+                    if let Some(tracker) = &self.tracker {
+                        tracker.observe(&view.location, &view.page, true);
+                    }
+                }
+
+                self.reset_view();
+                self.message(warning.unwrap_or_default(), false);
+                self.remember_view();
+            }
             Ok(Completed::LoginForm(form, rejected)) => {
                 self.login_form = Some(form);
 
@@ -669,6 +835,10 @@ impl App {
             }
             Ok(Completed::Suggestion(_)) => {}
             Ok(Completed::Page(location, page, replace)) => {
+                if let Some(tracker) = &self.tracker {
+                    tracker.observe(&location, &page, true);
+                }
+
                 self.page_cache.insert(location.clone(), page.clone());
 
                 if replace && let Some(v) = &mut self.nav.current {
@@ -686,7 +856,8 @@ impl App {
             Ok(
                 Completed::Preview { .. }
                 | Completed::DownloadProgress { .. }
-                | Completed::DownloadsFinished { .. },
+                | Completed::DownloadsFinished { .. }
+                | Completed::Tracking(_),
             ) => {}
             Err(e) => {
                 if e.is::<auth::AccessDenied>() {
@@ -798,12 +969,14 @@ impl App {
                         self.browser_effects
                             .push(BrowserEffect::OpenFile(path.clone()));
                         self.message("Opened file.", false);
+                        self.mark_read(&Action::File(file.clone()));
 
                         return;
                     }
 
                     match open::that_detached(path) {
                         Ok(_) => {
+                            self.mark_read(&Action::File(file.clone()));
                             self.message("Opened file.", false);
                         }
                         Err(_) => self.message("Could not open viewer.", true),
@@ -829,6 +1002,11 @@ impl App {
 
         let Some(api) = self.api.clone() else {
             return;
+        };
+        self.opening_read = if open_file {
+            tracking::action_key(&action)
+        } else {
+            None
         };
 
         self.downloading = true;
@@ -1072,6 +1250,14 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return false;
         }
+
+        if key.code == KeyCode::Home && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.home();
+
+            return false;
+        }
+
+        self.notice.clear();
 
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return true;
@@ -1339,13 +1525,18 @@ impl App {
             return vec![
                 hint("↑↓", "scroll"),
                 hint("Esc", "close"),
+                hint("Ctrl-Home", "home"),
                 hint("q", "quit"),
             ];
         }
 
         if self.login_screen {
             if self.authenticating {
-                return vec![hint("Esc", "cancel"), hint("Ctrl-C", "quit")];
+                return vec![
+                    hint("Esc", "cancel"),
+                    hint("Ctrl-Home", "home"),
+                    hint("Ctrl-C", "quit"),
+                ];
             }
 
             let mut hints = vec![
@@ -1379,7 +1570,11 @@ impl App {
                 hints.push(hint("Esc", "back"));
             }
 
-            hints.extend([hint("F1", "help"), hint("Ctrl-C", "quit")]);
+            hints.extend([
+                hint("Ctrl-Home", "home"),
+                hint("F1", "help"),
+                hint("Ctrl-C", "quit"),
+            ]);
 
             return hints;
         }
@@ -1389,6 +1584,7 @@ impl App {
                 hint("←→", "edit"),
                 hint("Enter", "done"),
                 hint("Esc", "clear"),
+                hint("Ctrl-Home", "home"),
                 hint("Ctrl-C", "quit"),
             ];
         }
@@ -1397,12 +1593,17 @@ impl App {
             return vec![
                 hint("Type label", "select"),
                 hint("Esc", "cancel"),
+                hint("Ctrl-Home", "home"),
                 hint("Ctrl-C", "quit"),
             ];
         }
 
         if self.pending_g {
-            return vec![hint("g", "first"), hint("Esc", "cancel")];
+            return vec![
+                hint("g", "first"),
+                hint("Esc", "cancel"),
+                hint("Ctrl-Home", "home"),
+            ];
         }
 
         if self.busy {
@@ -1470,7 +1671,12 @@ impl App {
             hints.push(hint("x", "cancel download"));
         }
 
-        hints.extend([hint("r", "refresh"), hint("?", "help"), hint("q", "quit")]);
+        hints.extend([
+            hint("Ctrl-Home", "home"),
+            hint("r", "refresh"),
+            hint("?", "help"),
+            hint("q", "quit"),
+        ]);
 
         hints
     }
@@ -1524,6 +1730,14 @@ impl App {
             self.status.clone()
         };
 
+        if !self.notice.is_empty() {
+            status = if status.is_empty() {
+                self.notice.clone()
+            } else {
+                format!("{status} · {}", self.notice)
+            };
+        }
+
         if self.downloading {
             status = if status.is_empty() {
                 self.download_status.clone()
@@ -1554,11 +1768,13 @@ impl App {
 
         if !status.is_empty() {
             f.render_widget(
-                Paragraph::new(status).style(Style::default().fg(if self.status_error {
-                    RED
-                } else {
-                    MUTED
-                })),
+                Paragraph::new(status).style(Style::default().fg(
+                    if self.status_error || self.notice_error && !self.notice.is_empty() {
+                        RED
+                    } else {
+                        MUTED
+                    },
+                )),
                 chunks[2],
             );
         }
@@ -1864,12 +2080,24 @@ impl App {
                 .entries
                 .iter()
                 .map(|entry| {
-                    let mut lines = textwrap::wrap(&entry.title, width)
+                    let is_new = self
+                        .tracker
+                        .as_ref()
+                        .is_some_and(|tracker| tracker.is_new(&entry.action));
+                    let title = if is_new {
+                        format!("● {}", entry.title)
+                    } else {
+                        entry.title.clone()
+                    };
+
+                    let mut lines = textwrap::wrap(&title, width)
                         .iter()
                         .map(|s| {
                             Line::styled(
                                 s.to_string(),
-                                Style::default().fg(if matches!(entry.action, Action::File(_)) {
+                                Style::default().fg(if is_new {
+                                    GOLD
+                                } else if matches!(entry.action, Action::File(_)) {
                                     GREEN
                                 } else {
                                     INK
@@ -1988,7 +2216,15 @@ impl App {
                         let tag = if let Some(jump) = &self.jump {
                             jump.label(index).to_string()
                         } else {
-                            String::new()
+                            if self
+                                .tracker
+                                .as_ref()
+                                .is_some_and(|tracker| tracker.is_new(&e.action))
+                            {
+                                "●".into()
+                            } else {
+                                String::new()
+                            }
                         };
 
                         let active = self.jump.as_ref().is_none_or(|j| {
@@ -2282,7 +2518,7 @@ fn hint_lines(hints: &[Hint], width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-const HELP: &str = "↑ / ↓ or j / k    Move / scroll focused pane\nEnter / → / l    Open selected item\n← / h / b        Back\n/                Filter; Enter finishes, Esc clears\nf                Jump: type a row label, then Enter to open\ngg / G           First / last\nTab              Switch text / files\nPgUp / PgDn      Scroll a page\nd                Download selected branch; focused text: all files here\nx                Cancel download\nr                Refresh\nL                Sign in\nq / Ctrl-C       Quit\n\nLogin\nTab / Shift-Tab / ↑↓   Change field\nEnter            Next field / sign in\n← / →            Move caret\nHome / End       Start / end of field\nDelete / Backspace   Delete at / before caret\nF2               New CAPTCHA\nF4               Enlarge CAPTCHA\nF5               Suggest code with local OCR\nEsc              Cancel and clear password\nCtrl-C           Quit\n\nEsc / ? / F1     Close help";
+const HELP: &str = "↑ / ↓ or j / k    Move / scroll focused pane\nEnter / → / l    Open selected item\n← / h / b        Back\n/                Filter; Enter finishes, Esc clears\nf                Jump: type a row label, then Enter to open\ngg / G           First / last\nTab              Switch text / files\nPgUp / PgDn      Scroll a page\nd                Download selected branch; focused text: all files here\nx                Cancel download\nr                Refresh\nL                Sign in\nCtrl-Home        Courses (from any screen)\n●                New since the previous fetched list; opening marks read locally\nq / Ctrl-C       Quit\n\nLogin\nTab / Shift-Tab / ↑↓   Change field\nEnter            Next field / sign in\n← / →            Move caret\nHome / End       Start / end of field\nDelete / Backspace   Delete at / before caret\nF2               New CAPTCHA\nF4               Enlarge CAPTCHA\nF5               Suggest code with local OCR\nEsc              Cancel and clear password\nCtrl-C           Quit\n\nEsc / ? / F1     Close help";
 
 pub async fn run(session: PathBuf, download_dir: PathBuf) -> Result<()> {
     run_mode(session, download_dir, false).await
@@ -2300,7 +2536,7 @@ async fn run_mode(session: PathBuf, download_dir: PathBuf, force_login: bool) ->
         app.login_screen = true;
         app.needs_login_form = true;
     } else if app.api.is_some() {
-        app.load(Location::Catalog("/courses".into()), false);
+        app.start_location();
     }
 
     let mut terminal = ratatui::init();
@@ -2366,6 +2602,7 @@ async fn run_mode(session: PathBuf, download_dir: PathBuf, force_login: bool) ->
 
     app.remember_view();
 
+    app.tracker.take();
     app.login_fields.clear_secrets();
     ratatui::restore();
 
@@ -2418,7 +2655,7 @@ fn browser_keys(label: &str) -> Vec<String> {
         "Tab/→" => vec!["Tab".into()],
         "←/h" | "←" => vec!["ArrowLeft".into()],
         "Ctrl-C" => vec!["Ctrl+c".into()],
-
+        "Ctrl-Home" => vec!["Ctrl+Home".into()],
         "Type label" => vec!["TextInput".into()],
         other => vec![other.into()],
     }
@@ -2441,7 +2678,7 @@ impl BrowserApp {
         app.browser = true;
 
         if app.api.is_some() {
-            app.load(Location::Catalog("/courses".into()), false);
+            app.start_location();
         }
 
         Ok(Self {
@@ -2712,6 +2949,7 @@ impl Drop for BrowserApp {
         self.app.clear_preview();
         self.app.remember_view();
 
+        self.app.tracker.take();
         self.app.login_fields.clear_secrets();
     }
 }

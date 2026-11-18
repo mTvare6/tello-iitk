@@ -5,5 +5,6 @@ pub mod model;
 pub mod navigation;
 pub mod ocr;
 pub mod text;
+pub mod tracking;
 pub mod tui;
 pub mod web;
