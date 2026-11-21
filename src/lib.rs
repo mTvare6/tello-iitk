@@ -7,4 +7,5 @@ pub mod ocr;
 pub mod text;
 pub mod tracking;
 pub mod tui;
+pub mod vault;
 pub mod web;

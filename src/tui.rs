@@ -4,7 +4,7 @@ use crate::{
     model::*,
     navigation::Navigation,
     text::{Cursor, Edit},
-    tracking,
+    tracking, vault,
 };
 use anyhow::Result;
 use crossterm::event::{
@@ -56,12 +56,22 @@ enum Completed {
         location: Location,
         result: Result<Page>,
     },
-    Authenticated(Api),
+    Authenticated(Api, Option<(String, zeroize::Zeroizing<String>)>),
     Restored(Vec<crate::navigation::View>, Option<String>),
     Tracking(Result<()>),
-
+    Credential {
+        id: u64,
+        username: String,
+        result: Result<CredentialReply>,
+    },
     LoginForm(Box<login::Challenge>, Option<&'static str>),
     Suggestion(Option<String>),
+}
+
+enum CredentialReply {
+    Loaded(Option<zeroize::Zeroizing<String>>),
+    Saved,
+    Forgotten,
 }
 
 #[derive(Clone, Debug)]
@@ -135,7 +145,9 @@ struct App {
     browser: bool,
     tracker: Option<tracking::Tracker>,
     home_requested: bool,
-
+    remember_password: bool,
+    credential_job: Option<tokio::task::JoinHandle<()>>,
+    credential_id: u64,
     notice: String,
     notice_error: bool,
     browser_files: Vec<PathBuf>,
@@ -194,7 +206,7 @@ impl App {
         session: PathBuf,
         download_dir: PathBuf,
         tx: mpsc::UnboundedSender<(u64, Result<Completed>)>,
-    ) -> Self {
+    ) -> Result<Self> {
         let (api, status) = match Api::new(&session) {
             Ok(api) => (Some(api), String::new()),
             Err(e) => (
@@ -207,12 +219,14 @@ impl App {
             ),
         };
 
+        let preferences = tracking::Preferences::load()?;
+
         let mut login_fields = login::Fields {
             username: auth::identity(&session)
                 .ok()
                 .map(|(_, name)| name)
                 .filter(|s| !s.is_empty())
-                .unwrap_or_default(),
+                .unwrap_or(preferences.username),
             ..Default::default()
         };
 
@@ -222,7 +236,9 @@ impl App {
             browser: false,
             tracker: None,
             home_requested: false,
-
+            remember_password: preferences.save_password,
+            credential_job: None,
+            credential_id: 0,
             notice: String::new(),
             notice_error: false,
             browser_files: Vec::new(),
@@ -278,7 +294,7 @@ impl App {
 
         app.attach_tracker();
 
-        app
+        Ok(app)
     }
 
     fn attach_tracker(&mut self) {
@@ -399,6 +415,57 @@ impl App {
         }
     }
 
+    fn start_credential(&mut self, kind: &str, password: Option<zeroize::Zeroizing<String>>) {
+        if self.browser {
+            return;
+        }
+
+        if let Some(task) = self.credential_job.take() {
+            task.abort();
+        }
+
+        self.credential_id += 1;
+
+        let id = self.credential_id;
+        let username = self.login_fields.username.clone();
+        let tx = self.tx.clone();
+        let kind = kind.to_owned();
+        self.credential_job = Some(tokio::spawn(async move {
+            let result = match kind.as_str() {
+                "load" => vault::load(&username).await.map(CredentialReply::Loaded),
+                "save" => vault::save(
+                    &username,
+                    password.as_deref().map(|s| s.as_str()).unwrap_or(""),
+                )
+                .await
+                .map(|_| CredentialReply::Saved),
+                _ => vault::forget(&username)
+                    .await
+                    .map(|_| CredentialReply::Forgotten),
+            };
+
+            let _ = tx.send((
+                0,
+                Ok(Completed::Credential {
+                    id,
+                    username,
+                    result,
+                }),
+            ));
+        }));
+    }
+
+    fn maybe_load_password(&mut self) {
+        if !self.browser
+            && self.remember_password
+            && self.login_fields.password.is_empty()
+            && !self.login_fields.username.is_empty()
+            && self.credential_job.is_none()
+        {
+            self.start_credential("load", None);
+        }
+    }
+
     fn mark_read(&self, action: &Action) {
         if let Some(tracker) = &self.tracker
             && let Some(key) = tracking::action_key(action)
@@ -506,6 +573,7 @@ impl App {
 
         let generation = self.generation;
         self.message("Loading…", false);
+        self.maybe_load_password();
 
         let tx = self.tx.clone();
         self.pending = Some(tokio::spawn(async move {
@@ -582,6 +650,15 @@ impl App {
             solver.abort();
         }
 
+        let saved_password = if !self.browser && self.remember_password {
+            Some((
+                self.login_fields.username.clone(),
+                self.login_fields.password.clone(),
+            ))
+        } else {
+            None
+        };
+
         let credentials = self.login_fields.take();
         let session = self.session.clone();
         self.busy = true;
@@ -595,9 +672,10 @@ impl App {
         self.pending = Some(tokio::spawn(async move {
             let result = async {
                 match form.submit(credentials, &session).await? {
-                    login::Outcome::Authenticated => {
-                        Ok(Completed::Authenticated(Api::new(&session)?))
-                    }
+                    login::Outcome::Authenticated => Ok(Completed::Authenticated(
+                        Api::new(&session)?,
+                        saved_password,
+                    )),
                     login::Outcome::Rejected(form, reason) => {
                         Ok(Completed::LoginForm(form, Some(reason)))
                     }
@@ -617,7 +695,44 @@ impl App {
                     self.notice_error = true;
                 }
             }
+            Ok(Completed::Credential {
+                id,
+                username,
+                result,
+            }) => {
+                if id != self.credential_id {
+                    return;
+                }
 
+                self.credential_job = None;
+
+                match result {
+                    Ok(CredentialReply::Loaded(Some(password)))
+                        if !self.browser
+                            && self.login_screen
+                            && !self.authenticating
+                            && self.remember_password
+                            && self.login_fields.username == username
+                            && self.login_fields.password.is_empty() =>
+                    {
+                        self.login_fields.cursors[1].position = password.chars().count();
+                        self.login_fields.password = password;
+                    }
+                    Ok(CredentialReply::Loaded(_)) => {}
+                    Ok(CredentialReply::Saved) => {
+                        self.notice = "Password saved in desktop keyring.".into();
+                        self.notice_error = false;
+                    }
+                    Ok(CredentialReply::Forgotten) => {
+                        self.notice = "Saved password removed from desktop keyring.".into();
+                        self.notice_error = false;
+                    }
+                    Err(error) => {
+                        self.notice = error.to_string();
+                        self.notice_error = true;
+                    }
+                }
+            }
             Ok(Completed::Preview {
                 id,
                 location,
@@ -789,7 +904,7 @@ impl App {
         self.pending = None;
 
         match result {
-            Ok(Completed::Authenticated(api)) => {
+            Ok(Completed::Authenticated(api, saved_password)) => {
                 self.show_captcha = false;
                 self.page_cache.clear();
                 self.login_fields.clear_secrets();
@@ -800,7 +915,23 @@ impl App {
                 self.reset_view();
                 self.attach_tracker();
 
+                if !self.browser {
+                    let preferences = tracking::Preferences {
+                        username: self.login_fields.username.clone(),
+                        save_password: self.remember_password,
+                    };
+
+                    if let Err(error) = preferences.save() {
+                        self.notice = error.to_string();
+                        self.notice_error = true;
+                    }
+                }
+
                 self.start_location();
+
+                if let Some((_, password)) = saved_password {
+                    self.start_credential("save", Some(password));
+                }
             }
             Ok(Completed::Restored(mut views, warning)) => {
                 self.nav.current = views.pop();
@@ -857,7 +988,8 @@ impl App {
                 Completed::Preview { .. }
                 | Completed::DownloadProgress { .. }
                 | Completed::DownloadsFinished { .. }
-                | Completed::Tracking(_),
+                | Completed::Tracking(_)
+                | Completed::Credential { .. },
             ) => {}
             Err(e) => {
                 if e.is::<auth::AccessDenied>() {
@@ -1303,20 +1435,43 @@ impl App {
                         self.message(clean(&format!("Cannot open CAPTCHA image: {e}")), true);
                     }
                 }
+                KeyCode::F(6) if !self.browser && !self.authenticating => {
+                    self.remember_password = !self.remember_password;
 
+                    let result = tracking::Preferences {
+                        username: self.login_fields.username.clone(),
+                        save_password: self.remember_password,
+                    }
+                    .save();
+
+                    if let Err(error) = result {
+                        self.notice = error.to_string();
+                        self.notice_error = true;
+                    }
+
+                    if !self.remember_password {
+                        self.start_credential("forget", None);
+                    } else {
+                        self.notice = "Password will be saved after successful sign-in.".into();
+                        self.notice_error = false;
+                    }
+                }
                 KeyCode::F(5) if !self.authenticating => {
                     self.login_fields.set_captcha(String::new());
                     self.suggest_code();
                 }
                 KeyCode::Tab | KeyCode::Down if !self.authenticating => {
                     self.move_login_focus(false);
+                    self.maybe_load_password();
                 }
                 KeyCode::BackTab | KeyCode::Up if !self.authenticating => {
                     self.move_login_focus(true);
+                    self.maybe_load_password();
                 }
                 KeyCode::Enter if !self.authenticating => {
                     if self.login_fields.focus == 0 {
                         self.login_fields.focus = 1;
+                        self.maybe_load_password();
                     } else if self.login_fields.focus == 1 && self.show_captcha {
                         self.login_fields.focus = 2;
                     } else {
@@ -1564,6 +1719,17 @@ impl App {
 
             if self.show_captcha {
                 hints.push(hint("F4", "enlarge"));
+            }
+
+            if !self.browser {
+                hints.push(hint(
+                    "F6",
+                    if self.remember_password {
+                        "save password: on"
+                    } else {
+                        "save password: off"
+                    },
+                ));
             }
 
             if self.api.is_some() {
@@ -2518,7 +2684,7 @@ fn hint_lines(hints: &[Hint], width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-const HELP: &str = "↑ / ↓ or j / k    Move / scroll focused pane\nEnter / → / l    Open selected item\n← / h / b        Back\n/                Filter; Enter finishes, Esc clears\nf                Jump: type a row label, then Enter to open\ngg / G           First / last\nTab              Switch text / files\nPgUp / PgDn      Scroll a page\nd                Download selected branch; focused text: all files here\nx                Cancel download\nr                Refresh\nL                Sign in\nCtrl-Home        Courses (from any screen)\n●                New since the previous fetched list; opening marks read locally\nq / Ctrl-C       Quit\n\nLogin\nTab / Shift-Tab / ↑↓   Change field\nEnter            Next field / sign in\n← / →            Move caret\nHome / End       Start / end of field\nDelete / Backspace   Delete at / before caret\nF2               New CAPTCHA\nF4               Enlarge CAPTCHA\nF5               Suggest code with local OCR\nEsc              Cancel and clear password\nCtrl-C           Quit\n\nEsc / ? / F1     Close help";
+const HELP: &str = "↑ / ↓ or j / k    Move / scroll focused pane\nEnter / → / l    Open selected item\n← / h / b        Back\n/                Filter; Enter finishes, Esc clears\nf                Jump: type a row label, then Enter to open\ngg / G           First / last\nTab              Switch text / files\nPgUp / PgDn      Scroll a page\nd                Download selected branch; focused text: all files here\nx                Cancel download\nr                Refresh\nL                Sign in\nCtrl-Home        Courses (from any screen)\n●                New since the previous fetched list; opening marks read locally\nq / Ctrl-C       Quit\n\nLogin\nTab / Shift-Tab / ↑↓   Change field\nEnter            Next field / sign in\n← / →            Move caret\nHome / End       Start / end of field\nDelete / Backspace   Delete at / before caret\nF2               New CAPTCHA\nF4               Enlarge CAPTCHA\nF5               Suggest code with local OCR\nF6               Save password in desktop keyring (desktop only)\nEsc              Cancel and clear password\nCtrl-C           Quit\n\nEsc / ? / F1     Close help";
 
 pub async fn run(session: PathBuf, download_dir: PathBuf) -> Result<()> {
     run_mode(session, download_dir, false).await
@@ -2530,7 +2696,7 @@ pub async fn run_login(session: PathBuf, download_dir: PathBuf) -> Result<()> {
 
 async fn run_mode(session: PathBuf, download_dir: PathBuf, force_login: bool) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut app = App::new(session, download_dir, tx);
+    let mut app = App::new(session, download_dir, tx)?;
 
     if force_login {
         app.login_screen = true;
@@ -2601,6 +2767,10 @@ async fn run_mode(session: PathBuf, download_dir: PathBuf, force_login: bool) ->
     );
 
     app.remember_view();
+
+    if let Some(task) = app.credential_job.take() {
+        task.abort();
+    }
 
     app.tracker.take();
     app.login_fields.clear_secrets();
@@ -2674,8 +2844,9 @@ impl BrowserApp {
     pub(crate) fn new(session: PathBuf, download_dir: PathBuf) -> Result<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let mut app = App::new(session, download_dir, tx);
+        let mut app = App::new(session, download_dir, tx)?;
         app.browser = true;
+        app.remember_password = false;
 
         if app.api.is_some() {
             app.start_location();
@@ -2948,6 +3119,10 @@ impl Drop for BrowserApp {
         self.app.cancel_downloads();
         self.app.clear_preview();
         self.app.remember_view();
+
+        if let Some(task) = self.app.credential_job.take() {
+            task.abort();
+        }
 
         self.app.tracker.take();
         self.app.login_fields.clear_secrets();

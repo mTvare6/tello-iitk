@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use hello_iitk::{auth, tui, web};
+use hello_iitk::{auth, tracking, tui, vault, web};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -27,6 +27,11 @@ enum Command {
     Login,
     /// Delete the saved session.
     Logout,
+    /// Remove a password from the desktop keyring.
+    ForgetPassword {
+        /// Username (defaults to the last account).
+        username: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -45,7 +50,20 @@ async fn main() -> Result<()> {
 
             println!("Local session removed.");
         }
+        Some(Command::ForgetPassword { username }) => {
+            let mut preferences = tracking::Preferences::load()?;
+            let username = username
+                .or_else(|| auth::identity(&session).ok().map(|(_, name)| name))
+                .unwrap_or_else(|| preferences.username.clone());
+            vault::forget(&username).await?;
 
+            if preferences.username == username {
+                preferences.save_password = false;
+                preferences.save()?;
+            }
+
+            println!("Saved desktop password removed.");
+        }
         None => tui::run(session, download_dir).await?,
     }
 

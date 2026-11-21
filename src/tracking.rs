@@ -36,6 +36,12 @@ impl SavedView {
     }
 }
 
+#[derive(Default, Serialize, Deserialize)]
+pub struct Preferences {
+    pub username: String,
+    pub save_password: bool,
+}
+
 pub fn root() -> Result<PathBuf> {
     let path = auth::session_path()?
         .parent()
@@ -94,6 +100,31 @@ fn private(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+impl Preferences {
+    pub fn load() -> Result<Self> {
+        let path = root()?.join("desktop.json");
+        private(&path)?;
+
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("Invalid desktop preferences"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let directory = root()?;
+
+        let mut file = tempfile::NamedTempFile::new_in(&directory)?;
+        serde_json::to_writer(file.as_file_mut(), self)?;
+        file.as_file().sync_all()?;
+        file.persist(directory.join("desktop.json"))
+            .map_err(|e| e.error)?;
+
+        Ok(())
+    }
 }
 
 pub fn location_key(location: &Location) -> String {
