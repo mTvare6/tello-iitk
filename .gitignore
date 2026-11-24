@@ -2,3 +2,9 @@
 /.local/
 session.json
 *.har
+
+/node_modules/
+/dist/
+
+.env
+.env.*

@@ -1,13 +1,14 @@
-use crate::{
-    auth::{self, ORIGIN},
-    model::parse_catalog,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::auth::{self, ORIGIN};
+use crate::model::parse_catalog;
 use anyhow::{Context, Result, bail};
 use image::RgbImage;
+#[cfg(not(target_arch = "wasm32"))]
 use reqwest::{Client, Response, header::HeaderValue};
 use scraper::{Html, Selector};
+use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
 use std::{
-    path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -18,11 +19,13 @@ fn at_origin(url: &Url, origin: &url::Origin) -> bool {
     url.origin() == *origin && url.username().is_empty() && url.password().is_none()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Cookies {
     store: Mutex<cookie_store::CookieStore>,
     origin: url::Origin,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Cookies {
     fn new(origin: &Url) -> Self {
         Self {
@@ -36,6 +39,7 @@ impl Cookies {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl reqwest::cookie::CookieStore for Cookies {
     fn set_cookies(&self, cookies: &mut dyn Iterator<Item = &HeaderValue>, url: &Url) {
         if !self.accepts(url) {
@@ -71,6 +75,7 @@ impl reqwest::cookie::CookieStore for Cookies {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Cookies {
     fn snapshot(&self) -> auth::Session {
         let store = self.store.lock().unwrap();
@@ -98,6 +103,7 @@ impl Cookies {
 
 struct Form {
     action: Url,
+    #[cfg(not(target_arch = "wasm32"))]
     referer: Url,
     hidden: Vec<(String, String)>,
     captcha: Option<Url>,
@@ -193,6 +199,7 @@ fn parse_form(html: &str, base: &Url) -> Result<Form> {
 
     Ok(Form {
         action,
+        #[cfg(not(target_arch = "wasm32"))]
         referer: base.clone(),
         hidden,
         captcha,
@@ -258,12 +265,31 @@ impl Fields {
     }
 }
 
+fn decode_image(bytes: &[u8]) -> Result<RgbImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(2048);
+    limits.max_image_height = Some(2048);
+    limits.max_alloc = Some(16 * 1024 * 1024);
+    reader.limits(limits);
+
+    Ok(reader
+        .decode()
+        .context("Could not decode CAPTCHA image")?
+        .to_rgb8())
+}
+
 pub struct Challenge {
+    #[cfg(not(target_arch = "wasm32"))]
     client: Client,
+    #[cfg(not(target_arch = "wasm32"))]
     cookies: Arc<Cookies>,
     form: Form,
     pub image: Option<RgbImage>,
+    #[cfg(not(target_arch = "wasm32"))]
     preview: Option<tempfile::NamedTempFile>,
+    #[cfg(target_arch = "wasm32")]
+    preview: Option<Vec<u8>>,
 }
 
 pub enum Outcome {
@@ -272,6 +298,7 @@ pub enum Outcome {
 }
 
 impl Challenge {
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn fetch() -> Result<Self> {
         let origin = Url::parse(ORIGIN)?;
         let cookies = Arc::new(Cookies::new(&origin));
@@ -302,6 +329,7 @@ impl Challenge {
         Self::from_html(client, cookies, &html, &url).await
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn from_html(
         client: Client,
         cookies: Arc<Cookies>,
@@ -318,18 +346,7 @@ impl Challenge {
 
             let bytes = read(response, 2 * 1024 * 1024).await?;
 
-            let mut reader =
-                image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format()?;
-            let mut limits = image::Limits::default();
-            limits.max_image_width = Some(2048);
-            limits.max_image_height = Some(2048);
-            limits.max_alloc = Some(16 * 1024 * 1024);
-            reader.limits(limits);
-
-            let image = reader
-                .decode()
-                .context("Could not decode CAPTCHA image")?
-                .to_rgb8();
+            let image = decode_image(&bytes)?;
 
             let mut preview = tempfile::Builder::new()
                 .prefix("hello-captcha-")
@@ -356,16 +373,19 @@ impl Challenge {
         self.form.captcha.is_some()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn ocr_image(&self) -> Option<Vec<u8>> {
         std::fs::read(self.preview.as_ref()?.path()).ok()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_image(&self) -> Result<()> {
         open::that_detached(self.preview.as_ref().context("No CAPTCHA image")?.path())?;
 
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn submit(self, credentials: Credentials, path: &Path) -> Result<Outcome> {
         if credentials.username.is_empty() || credentials.password.is_empty() {
             bail!("Enter your username and password");
@@ -459,6 +479,7 @@ fn rejection_reason(html: &str) -> &'static str {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn read(mut response: Response, limit: usize) -> Result<Vec<u8>> {
     if !response.status().is_success() {
         bail!(
@@ -482,4 +503,102 @@ async fn read(mut response: Response, limit: usize) -> Result<Vec<u8>> {
     }
 
     Ok(bytes)
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Challenge {
+    pub async fn fetch() -> Result<Self> {
+        let response = crate::browser::http::request("/user/login", None).await?;
+        if !(200..300).contains(&response.status) {
+            bail!("Login service returned HTTP {}", response.status);
+        }
+
+        Self::from_html(
+            &String::from_utf8(response.body)?,
+            &Url::parse(&response.url)?,
+        )
+        .await
+    }
+
+    async fn from_html(html: &str, base: &Url) -> Result<Self> {
+        let form = parse_form(html, base)?;
+        let (image, preview) = if let Some(url) = &form.captcha {
+            let path = format!(
+                "{}{}",
+                url.path(),
+                url.query().map(|q| format!("?{q}")).unwrap_or_default()
+            );
+            let response = crate::browser::http::request(&path, None).await?;
+            if response.status != 200 || response.body.len() > 2 * 1024 * 1024 {
+                bail!("Could not load CAPTCHA image");
+            }
+            let image = decode_image(&response.body)?;
+            (Some(image), Some(response.body))
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
+            form,
+            image,
+            preview,
+        })
+    }
+
+    pub fn ocr_image(&self) -> Option<Vec<u8>> {
+        self.preview.clone()
+    }
+
+    pub fn open_image(&self) -> Result<()> {
+        bail!("Open the image in the browser")
+    }
+
+    pub async fn submit(self, credentials: Credentials, _path: &Path) -> Result<Outcome> {
+        if credentials.username.is_empty() || credentials.password.is_empty() {
+            bail!("Enter your username and password");
+        }
+        let mut fields = self.form.hidden.clone();
+        fields.push(("name".into(), credentials.username.clone()));
+        fields.push(("pass".into(), credentials.password.to_string()));
+        if self.has_captcha() {
+            fields.push(("captcha_response".into(), credentials.captcha.clone()));
+        }
+        let body = Zeroizing::new(
+            url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(fields.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .finish(),
+        );
+        use zeroize::Zeroize;
+        for (_, value) in &mut fields {
+            value.zeroize();
+        }
+        let path = format!(
+            "{}{}",
+            self.form.action.path(),
+            self.form
+                .action
+                .query()
+                .map(|q| format!("?{q}"))
+                .unwrap_or_default()
+        );
+        let response = crate::browser::http::request(&path, Some(body.as_str())).await?;
+        let html = String::from_utf8(response.body)?;
+
+        if Html::parse_document(&html)
+            .select(&select("form.user-login-form"))
+            .next()
+            .is_some()
+        {
+            return Ok(Outcome::Rejected(
+                Box::new(Self::from_html(&html, &Url::parse(&response.url)?).await?),
+                rejection_reason(&html),
+            ));
+        }
+
+        let response = crate::browser::http::request("/courses", None).await?;
+        parse_catalog(std::str::from_utf8(&response.body)?, "/courses")?;
+        crate::browser::http::bootstrap().await?;
+
+        Ok(Outcome::Authenticated)
+    }
 }

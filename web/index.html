@@ -8,13 +8,22 @@
         />
         <meta name="color-scheme" content="dark" />
         <title>Courses</title>
-        <link rel="stylesheet" href="/style.css" />
-        <script src="/app.js" defer></script>
+        <link rel="stylesheet" href="./style.css" />
+        <script src="./app.js" defer></script>
+        <script
+            data-goatcounter="https://epestr.goatcounter.com/count"
+            data-goatcounter-settings='{"path":"/hello","title":"Courses","no_events":true}'
+            async
+            src="https://gc.zgo.at/count.js"
+        ></script>
     </head>
 
     <body>
+        <nav id="site" aria-label="Personal website">
+            <a href="https://epestr.com/">← epestr.com</a>
+        </nav>
         <main id="terminal" tabindex="0" aria-label="Course terminal">
-            <canvas id="screen" aria-label="Terminal screen"></canvas>
+            <div id="screen" aria-hidden="true"></div>
             <pre id="accessible-screen" class="sr-only" aria-live="polite"></pre>
         </main>
 

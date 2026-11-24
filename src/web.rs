@@ -377,7 +377,7 @@ async fn effect(session: &Arc<Mutex<Session>>, effect: BrowserEffect) -> Result<
 
             Ok(json!({"type":"open","url":url}))
         }
-        BrowserEffect::DownloadFiles(files) => {
+        BrowserEffect::DownloadFiles(name, files) => {
             ensure!(!files.is_empty(), "No downloaded files");
 
             if files.len() == 1 {
@@ -481,7 +481,7 @@ async fn effect(session: &Arc<Mutex<Session>>, effect: BrowserEffect) -> Result<
             )
             .await?;
 
-            Ok(json!({"type":"download","url":url}))
+            Ok(json!({"type":"download","url":url,"name":name}))
         }
     }
 }

@@ -5,15 +5,14 @@ const screen = document.getElementById("screen");
 const keys = document.getElementById("keys");
 const input = document.getElementById("input");
 const accessible = document.getElementById("accessible-screen");
-const context = screen.getContext("2d", { alpha: false });
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-const fontFamily = getComputedStyle(document.documentElement).fontFamily;
-const fontSize = 14,
-    cellHeight = 20;
+const cellHeight = 20;
+const measure = node("span", "M".repeat(100), "measure");
+measure.setAttribute("aria-hidden", "true");
+document.body.append(measure);
+const cellWidth = measure.getBoundingClientRect().width / 100;
+measure.remove();
 
-context.font = `${fontSize}px ${fontFamily}`;
-
-const cellWidth = context.measureText("M").width;
 let socket,
     frame,
     lastSize = "",
@@ -202,62 +201,47 @@ function paint(next) {
         pendingTab = null;
     }
 
-    const dpr = devicePixelRatio || 1;
-    const width = next.width * cellWidth,
-        height = next.height * cellHeight;
-    screen.style.width = `${width}px`;
-    screen.style.height = `${height}px`;
-    const pixelWidth = Math.ceil(width * dpr),
-        pixelHeight = Math.ceil(height * dpr);
-
-    if (screen.width !== pixelWidth || screen.height !== pixelHeight) {
-        screen.width = pixelWidth;
-        screen.height = pixelHeight;
-    }
-
-    context.setTransform(dpr, 0, 0, dpr, 0, 0);
-    context.fillStyle = "#0f141e";
-    context.fillRect(0, 0, width, height);
-    context.textBaseline = "alphabetic";
+    screen.style.width = `${next.width * cellWidth}px`;
+    screen.style.height = `${next.height * cellHeight}px`;
+    const rows = Array.from({ length: next.height }, (_, index) => {
+        const row = node("div", undefined, "terminal-row");
+        row.style.top = `${index * cellHeight}px`;
+        return row;
+    });
     const textRows = Array.from({ length: next.height }, () => "");
 
     for (const run of next.runs) {
-        const bold = Boolean(run.modifiers & 1),
-            italic = Boolean(run.modifiers & 4),
-            reverse = Boolean(run.modifiers & 64);
-        context.font = `${italic ? "italic " : ""}${bold ? "bold " : ""}${fontSize}px ${fontFamily}`;
-        const extent =
-            run.widths.reduce((total, width) => total + width, 0) * cellWidth;
-        context.fillStyle = reverse ? run.fg : run.bg;
-        context.fillRect(
-            run.x * cellWidth,
-            run.y * cellHeight,
-            extent + 0.25,
-            cellHeight,
-        );
-        context.fillStyle = reverse ? run.bg : run.fg;
-        let column = run.x,
-            index = 0;
+        const reverse = Boolean(run.modifiers & 64);
+        const span = node("span", undefined, "terminal-run");
+        span.style.left = `${run.x * cellWidth}px`;
+        span.style.width = `${run.widths.reduce((total, width) => total + width, 0) * cellWidth}px`;
+        span.style.color = reverse ? run.bg : run.fg;
+        span.style.backgroundColor = reverse ? run.fg : run.bg;
+        if (run.modifiers & 1) span.style.fontWeight = "bold";
+        if (run.modifiers & 2) span.style.opacity = "0.65";
+        if (run.modifiers & 4) span.style.fontStyle = "italic";
+        if (run.modifiers & 128) span.style.visibility = "hidden";
+        const decoration = [];
+        if (run.modifiers & 8) decoration.push("underline");
+        if (run.modifiers & 256) decoration.push("line-through");
+        span.style.textDecorationLine = decoration.join(" ");
 
-        for (const { segment } of graphemes.segment(run.text)) {
-            const width = run.widths[index++] || 1;
-
-            if (segment !== " ")
-                context.fillText(
-                    segment,
-                    column * cellWidth,
-                    run.y * cellHeight + 15,
-                    width * cellWidth,
-                );
-
-            column += width;
+        if (run.widths.every(width => width === 1)) {
+            span.textContent = run.text;
+        } else {
+            let index = 0;
+            for (const { segment } of graphemes.segment(run.text)) {
+                const cell = node("span", segment, "terminal-cell");
+                cell.style.width = `${(run.widths[index++] || 1) * cellWidth}px`;
+                span.append(cell);
+            }
         }
 
-        if (run.modifiers & 8)
-            context.fillRect(run.x * cellWidth, run.y * cellHeight + 17, extent, 1);
-
+        rows[run.y].append(span);
         textRows[run.y] += run.text;
     }
+
+    screen.replaceChildren(...rows);
 
     accessible.textContent = textRows.map((row) => row.trimEnd()).join("\n");
     document.title = textRows[0]?.trim() || "Courses";
@@ -288,7 +272,7 @@ function openTarget(message) {
     if (message.type === "download") {
         const link = node("a");
         link.href = message.url;
-        link.download = "";
+        link.download = message.name || "";
         document.body.append(link);
         link.click();
         link.remove();
@@ -343,6 +327,17 @@ async function connect() {
         if (!response.ok)
             throw new Error("Cannot start terminal. Reload the page.");
 
+        if (response.headers.get("X-Hello-Transport") === "wasm") {
+            const client = await import("./client.js");
+            socket = await client.connect(await response.json(), message => {
+                if (message.type === "frame") paint(message.frame);
+                else if (["open", "download"].includes(message.type)) openTarget(message);
+            }, disconnected);
+            resize();
+
+            return;
+        }
+
         const url = new URL("/socket", location.href);
         url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
         const connection = new WebSocket(url);
@@ -373,6 +368,8 @@ async function connect() {
 }
 
 document.addEventListener("keydown", (event) => {
+    if (event.target.closest?.("#site")) return;
+
     if (
         composing ||
         event.isComposing ||

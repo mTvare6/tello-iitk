@@ -7,33 +7,48 @@ description = "Terminal and web browser for HelloIITK"
 license = "MIT"
 include = ["src/**", "web/**", "assets/**", "LICENSE", "Cargo.toml", "Cargo.lock"]
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 anyhow = "1"
+html2text = "0.16"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+ratatui = { version = "0.30", default-features = false, features = ["std", "layout-cache"] }
+scraper = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+textwrap = { version = "0.16", default-features = false, features = ["std", "unicode-width"] }
+url = "2"
+zeroize = { version = "1", features = ["serde"] }
+futures-util = "0.3"
+unicode-width = "0.2"
+time = "0.3"
+sha2 = "0.10"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 clap = { version = "4", features = ["derive"] }
 cookie_store = "0.22"
 crossterm = "0.29"
 directories = "6"
-html2text = "0.16"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 open = "5"
-ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "stream"] }
-scraper = "0.29"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "net", "signal", "process"] }
-textwrap = { version = "0.16", default-features = false, features = ["std", "unicode-width"] }
-url = "2"
-zeroize = { version = "1", features = ["serde"] }
 tempfile = "3"
 zip = { version = "=9.7.3", default-features = false }
 tract-onnx = "0.22"
 axum = { version = "0.8", features = ["ws"] }
-futures-util = "0.3"
 getrandom = "0.3"
-unicode-width = "0.2"
-time = "0.3"
 tower-http = { version = "0.6", features = ["fs"] }
 tower = { version = "0.5", features = ["util"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
-sha2 = "0.10"
+ratatui = { version = "0.30", features = ["crossterm", "underline-color", "macros", "all-widgets"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Storage", "Event", "EventTarget", "Request", "RequestInit", "RequestCredentials", "Response", "Headers", "Blob", "BlobPropertyBag", "Url", "AbortController", "AbortSignal"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+web-time = "1"

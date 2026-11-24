@@ -1,7 +1,11 @@
 use image::{GrayImage, ImageBuffer, Luma};
-use std::{io::Cursor, sync::OnceLock};
+use std::io::Cursor;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::OnceLock;
 
+#[cfg(not(target_arch = "wasm32"))]
 mod glyph_model;
+#[cfg(not(target_arch = "wasm32"))]
 mod neural;
 mod segments;
 
@@ -12,6 +16,7 @@ pub struct Prediction {
     pub confidence: f64,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn suggest_code(bytes: Vec<u8>) -> Option<Prediction> {
     if std::env::var("HELLO_CAPTCHA_OCR").as_deref() == Ok("0") {
         return None;
@@ -85,6 +90,7 @@ fn nearest_template(values: &[u8], templates: &[u8]) -> Option<(u64, u8)> {
         .filter(|(_, c)| c.is_ascii_alphanumeric())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn recognize(bytes: &[u8]) -> Option<Prediction> {
     let mask = decode_mask(bytes)?;
 
@@ -100,14 +106,19 @@ fn recognize(bytes: &[u8]) -> Option<Prediction> {
     default_predict(&mask, &clean)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const CNN_BYTES: &[u8] = include_bytes!("../assets/captcha-cnn.onnx");
 
+#[cfg(not(target_arch = "wasm32"))]
 static CNN: OnceLock<Option<neural::Network>> = OnceLock::new();
 
+#[cfg(not(target_arch = "wasm32"))]
 const GLYPH_BYTES: &[u8] = include_bytes!("../assets/captcha-glyph.onnx");
 
+#[cfg(not(target_arch = "wasm32"))]
 static GLYPH_CNN: OnceLock<Option<glyph_model::Network>> = OnceLock::new();
 
+#[cfg(not(target_arch = "wasm32"))]
 fn default_predict(mask: &GrayImage, clean: &GrayImage) -> Option<Prediction> {
     if let Some(network) =
         GLYPH_CNN.get_or_init(|| glyph_model::Network::from_bytes(GLYPH_BYTES).ok())
@@ -154,6 +165,7 @@ fn candidate_distance(letters: &[GrayImage]) -> u64 {
         .sum()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn predict_letters(letters: &[GrayImage]) -> Option<Prediction> {
     if letters.len() != 5 {
         return None;
@@ -168,6 +180,91 @@ fn predict_letters(letters: &[GrayImage]) -> Option<Prediction> {
 
         let similarity = 1.0 - (distance as f64 / TEMPLATE_SIZE as f64).sqrt() / 255.0;
         confidence = confidence.min(similarity);
+    }
+
+    Some(Prediction { text, confidence })
+}
+
+/// Keep the aspect ratio and detached parts of the letter.
+pub(super) fn normalize_glyph(mask: &GrayImage) -> Option<Vec<u8>> {
+    let (width, height) = mask.dimensions();
+
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let (out_w, out_h) = if width >= height {
+        (26, (height * 26 + width / 2) / width)
+    } else {
+        ((width * 26 + height / 2) / height, 26)
+    };
+
+    let (out_w, out_h) = (out_w.max(1), out_h.max(1));
+    let (left, top) = ((32 - out_w) / 2, (32 - out_h) / 2);
+
+    let mut output = vec![0; 32 * 32];
+
+    for y in 0..out_h {
+        for x in 0..out_w {
+            let sx = ((2 * x + 1) * width / (2 * out_w)).min(width - 1);
+            let sy = ((2 * y + 1) * height / (2 * out_h)).min(height - 1);
+            output[((top + y) * 32 + left + x) as usize] = 255 - mask.get_pixel(sx, sy)[0];
+        }
+    }
+
+    Some(output)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(module = "/web/ocr.js")]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(catch)]
+    async fn predict(
+        glyphs: js_sys::Array,
+        whole: js_sys::Uint8Array,
+    ) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn suggest_code(bytes: Vec<u8>) -> Option<Prediction> {
+    let mask = decode_mask(&bytes)?;
+    if mask.width() < 40
+        || mask.height() < 20
+        || mask.pixels().all(|p| p[0] == mask.get_pixel(0, 0)[0])
+    {
+        return None;
+    }
+    let clean = clean_frame(mask.clone());
+    let glyphs = js_sys::Array::new();
+    if let Some(crops) = select_glyphs(&clean) {
+        for crop in crops {
+            glyphs.push(&js_sys::Uint8Array::from(
+                normalize_glyph(&crop)?.as_slice(),
+            ));
+        }
+    }
+    let mut whole = Vec::with_capacity(64 * 160);
+    for y in 0..64 {
+        let sy = ((2 * y + 1) * mask.height() / 128).min(mask.height() - 1);
+        for x in 0..160 {
+            let sx = ((2 * x + 1) * mask.width() / 320).min(mask.width() - 1);
+            whole.push(255 - mask.get_pixel(sx, sy)[0]);
+        }
+    }
+    let result = predict(glyphs, js_sys::Uint8Array::from(whole.as_slice()))
+        .await
+        .ok()?;
+    let text = js_sys::Reflect::get(&result, &"text".into())
+        .ok()?
+        .as_string()?;
+    let confidence = js_sys::Reflect::get(&result, &"confidence".into())
+        .ok()?
+        .as_f64()?;
+    if text.len() != 5
+        || !text.bytes().all(|c| c.is_ascii_alphanumeric())
+        || !confidence.is_finite()
+    {
+        return None;
     }
 
     Some(Prediction { text, confidence })

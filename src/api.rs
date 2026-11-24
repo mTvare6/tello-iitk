@@ -3,17 +3,20 @@ use crate::{
     model::*,
 };
 use anyhow::{Context, Result, bail};
-use reqwest::{Client, StatusCode};
+#[cfg(not(target_arch = "wasm32"))]
+use reqwest::Client;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
-use tokio::{io::AsyncWriteExt, sync::Mutex};
+use tokio::sync::Mutex;
 use url::Url;
+#[cfg(not(target_arch = "wasm32"))]
+use {std::time::Duration, tokio::io::AsyncWriteExt};
 
+#[cfg(not(target_arch = "wasm32"))]
 const RESPONSE_LIMIT: usize = 32 * 1024 * 1024;
 const DOWNLOAD_LIMIT: u64 = 512 * 1024 * 1024;
 
@@ -31,6 +34,7 @@ pub struct DownloadPlan {
 
 #[derive(Clone)]
 pub struct Api {
+    #[cfg(not(target_arch = "wasm32"))]
     client: Client,
     cache: Arc<Mutex<ApiCache>>,
 }
@@ -62,6 +66,7 @@ impl ApiCache {
 }
 
 impl Api {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(session: &Path) -> Result<Self> {
         let client = Client::builder()
             .cookie_provider(auth::load(session)?)
@@ -92,6 +97,7 @@ impl Api {
         cache.bytes = 0;
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn get(&self, path: &str) -> Result<Vec<u8>> {
         let url = Url::parse(ORIGIN)?.join(path)?;
 
@@ -106,7 +112,7 @@ impl Api {
             .await
             .map_err(|e| anyhow::anyhow!("Request failed: {}", e.without_url()))?;
 
-        check_status(response.status())?;
+        check_status(response.status().as_u16())?;
 
         let mut body = Vec::new();
 
@@ -277,6 +283,7 @@ impl Api {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn download(
         &self,
         attachment: &Attachment,
@@ -302,7 +309,7 @@ impl Api {
             .await
             .map_err(|e| anyhow::anyhow!("Download request failed: {}", e.without_url()))?;
 
-        check_status(response.status())?;
+        check_status(response.status().as_u16())?;
 
         if response.url().path().starts_with("/user/")
             || response
@@ -460,11 +467,13 @@ where
     Ok(plan)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct PartialDownload {
     path: PathBuf,
     committed: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for PartialDownload {
     fn drop(&mut self) {
         if !self.committed {
@@ -489,13 +498,13 @@ pub fn same_origin(url: &Url) -> bool {
         && url.password().is_none()
 }
 
-fn check_status(status: StatusCode) -> Result<()> {
-    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+fn check_status(status: u16) -> Result<()> {
+    if matches!(status, 401 | 403) {
         return Err(auth::AccessDenied.into());
     }
 
-    if !status.is_success() {
-        bail!("Service returned HTTP {}", status.as_u16());
+    if !(200..300).contains(&status) {
+        bail!("HelloIITK returned HTTP {}", status);
     }
 
     Ok(())
@@ -555,6 +564,7 @@ pub fn safe_filename(name: &str) -> String {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn prepare_download_dir(directory: &Path) -> Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -568,4 +578,48 @@ fn prepare_download_dir(directory: &Path) -> Result<()> {
     builder.create(directory)?;
 
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Api {
+    pub fn new(session: &Path) -> Result<Self> {
+        auth::identity(session)?;
+
+        Ok(Self {
+            cache: Arc::default(),
+        })
+    }
+
+    async fn get(&self, path: &str) -> Result<Vec<u8>> {
+        let response = crate::browser::http::request(path, None).await?;
+        check_status(response.status)?;
+        reject_login(&response.body)?;
+
+        Ok(response.body)
+    }
+
+    pub async fn download(
+        &self,
+        attachment: &Attachment,
+        course: &Course,
+        _directory: &Path,
+    ) -> Result<PathBuf> {
+        validate_course_id(&course.id)?;
+        let url = Url::parse(ORIGIN)?.join(&attachment.url)?;
+
+        if !same_origin(&url)
+            || !(url.path().starts_with(&format!("/manage/{}/", course.id))
+                || url.path().starts_with("/sites/default/files/"))
+        {
+            bail!("Unrecognized attachment origin/path");
+        }
+
+        let name = format!(
+            "{}-{}-{}",
+            &course.id[..course.id.len().min(48)],
+            attachment.id,
+            safe_filename(&attachment.filename)
+        );
+        crate::browser::http::download(&url, name, DOWNLOAD_LIMIT).await
+    }
 }

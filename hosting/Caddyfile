@@ -1,0 +1,24 @@
+{$HELLO_HOSTS} {
+    encode zstd gzip
+
+    tls {
+        issuer acme
+    }
+
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy same-origin
+        X-Frame-Options DENY
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://gc.zgo.at; style-src 'self'; connect-src 'self' blob: https://epestr.goatcounter.com/count; img-src 'self' blob: data: https://epestr.goatcounter.com/count; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    }
+
+    @api path /api/*
+    handle @api {
+        reverse_proxy 127.0.0.1:8787
+    }
+
+    handle {
+        root * /opt/hello/dist
+        file_server
+    }
+}

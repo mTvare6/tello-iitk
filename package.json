@@ -1,0 +1,13 @@
+{
+    "name": "hello-iitk",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "build": "node web/build.mjs"
+    },
+    "devDependencies": {
+        "esbuild": "0.28.2",
+        "fflate": "0.8.3",
+        "onnxruntime-web": "1.31.1"
+    }
+}

@@ -1,0 +1,22 @@
+[Unit]
+Description=Course browser
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=hello
+Group=hello
+WorkingDirectory=/opt/hello
+EnvironmentFile=/etc/hello.env
+ExecStart=/usr/bin/node /opt/hello/hosting/server.mjs
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+MemoryMax=256M
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

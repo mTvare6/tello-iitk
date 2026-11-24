@@ -1,3 +1,7 @@
+use crate::input::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use crate::runtime::{self, Instant, sync::mpsc};
 use crate::{
     api::{Api, DownloadTarget},
     auth, login,
@@ -7,10 +11,8 @@ use crate::{
     tracking, vault,
 };
 use anyhow::Result;
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use crossterm::event::{self, Event};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -18,11 +20,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
-use std::{
-    path::PathBuf,
-    time::{Duration, Instant},
-};
-use tokio::sync::mpsc;
+use std::{path::PathBuf, time::Duration};
 
 const BG: Color = Color::Rgb(15, 20, 30);
 const PANEL: Color = Color::Rgb(22, 29, 42);
@@ -137,7 +135,7 @@ fn hint(key: &str, action: &str) -> Hint {
 pub(crate) enum BrowserEffect {
     OpenUrl(String),
     OpenFile(PathBuf),
-    DownloadFiles(Vec<PathBuf>),
+    DownloadFiles(String, Vec<PathBuf>),
     Image(Vec<u8>),
 }
 
@@ -146,7 +144,7 @@ struct App {
     tracker: Option<tracking::Tracker>,
     home_requested: bool,
     remember_password: bool,
-    credential_job: Option<tokio::task::JoinHandle<()>>,
+    credential_job: Option<runtime::task::JoinHandle<()>>,
     credential_id: u64,
     notice: String,
     notice_error: bool,
@@ -174,15 +172,16 @@ struct App {
     jump: Option<Jump>,
     pending_g: bool,
     download_dir: PathBuf,
-    pending: Option<tokio::task::JoinHandle<()>>,
-    solver: Option<tokio::task::JoinHandle<()>>,
-    downloader: Option<tokio::task::JoinHandle<()>>,
+    pending: Option<runtime::task::JoinHandle<()>>,
+    solver: Option<runtime::task::JoinHandle<()>>,
+    downloader: Option<runtime::task::JoinHandle<()>>,
     downloading: bool,
     opening_read: Option<String>,
     download_id: u64,
     download_status: String,
+    download_name: String,
     page_cache: std::collections::HashMap<Location, Page>,
-    preview_task: Option<tokio::task::JoinHandle<()>>,
+    preview_task: Option<runtime::task::JoinHandle<()>>,
     preview_id: u64,
     preview_target: Option<Location>,
     preview_page: Option<Page>,
@@ -211,7 +210,7 @@ impl App {
             Ok(api) => (Some(api), String::new()),
             Err(e) => (
                 None,
-                if session.exists() {
+                if runtime::file_exists(&session) {
                     clean(&format!("{e:#}"))
                 } else {
                     String::new()
@@ -272,6 +271,7 @@ impl App {
             opening_read: None,
             download_id: 0,
             download_status: String::new(),
+            download_name: String::new(),
             page_cache: Default::default(),
             preview_task: None,
             preview_id: 0,
@@ -354,7 +354,7 @@ impl App {
         self.message("Restoring location…", false);
 
         let tx = self.tx.clone();
-        self.pending = Some(tokio::spawn(async move {
+        self.pending = Some(runtime::spawn(async move {
             let result = async {
                 let mut views = Vec::new();
                 let mut warning = None;
@@ -430,7 +430,7 @@ impl App {
         let username = self.login_fields.username.clone();
         let tx = self.tx.clone();
         let kind = kind.to_owned();
-        self.credential_job = Some(tokio::spawn(async move {
+        self.credential_job = Some(runtime::spawn(async move {
             let result = match kind.as_str() {
                 "load" => vault::load(&username).await.map(CredentialReply::Loaded),
                 "save" => vault::save(
@@ -522,7 +522,7 @@ impl App {
         self.message("Loading…", false);
 
         let tx = self.tx.clone();
-        self.pending = Some(tokio::spawn(async move {
+        self.pending = Some(runtime::spawn(async move {
             if refresh {
                 api.clear_cache().await;
             }
@@ -576,7 +576,7 @@ impl App {
         self.maybe_load_password();
 
         let tx = self.tx.clone();
-        self.pending = Some(tokio::spawn(async move {
+        self.pending = Some(runtime::spawn(async move {
             let result = login::Challenge::fetch()
                 .await
                 .map(|f| Completed::LoginForm(Box::new(f), None));
@@ -669,7 +669,7 @@ impl App {
         self.message("Signing in…", false);
 
         let tx = self.tx.clone();
-        self.pending = Some(tokio::spawn(async move {
+        self.pending = Some(runtime::spawn(async move {
             let result = async {
                 match form.submit(credentials, &session).await? {
                     login::Outcome::Authenticated => Ok(Completed::Authenticated(
@@ -829,15 +829,15 @@ impl App {
                     if let Some(path) = open {
                         self.browser_effects.push(BrowserEffect::OpenFile(path));
                     } else if !self.browser_files.is_empty() {
-                        self.browser_effects
-                            .push(BrowserEffect::DownloadFiles(std::mem::take(
-                                &mut self.browser_files,
-                            )));
+                        self.browser_effects.push(BrowserEffect::DownloadFiles(
+                            self.download_name.clone(),
+                            std::mem::take(&mut self.browser_files),
+                        ));
                     }
 
                     self.browser_files.clear();
                 } else if let Some(path) = open
-                    && open::that_detached(&path).is_err()
+                    && runtime::open(&path).is_err()
                 {
                     self.message(
                         format!("Saved {} · could not open viewer", path.display()),
@@ -1025,7 +1025,7 @@ impl App {
 
         let generation = self.generation;
         let tx = self.tx.clone();
-        self.solver = Some(tokio::spawn(async move {
+        self.solver = Some(runtime::spawn(async move {
             let code = crate::ocr::suggest_code(image).await.map(|p| p.text);
             let _ = tx.send((generation, Ok(Completed::Suggestion(code))));
         }));
@@ -1091,12 +1091,16 @@ impl App {
                     .push(BrowserEffect::OpenUrl(url.into()));
                 self.message("Opened in browser.", false);
             }
-            Action::External(url) => match open::that_detached(url.as_str()) {
+            Action::External(url) => match runtime::open(url.as_str()) {
                 Ok(_) => self.message("Opened in browser.", false),
                 Err(_) => self.message("Could not open browser.", true),
             },
             Action::File(file) => {
-                if let Some(path) = self.opened.get(&file.url).filter(|p| p.exists()) {
+                if let Some(path) = self
+                    .opened
+                    .get(&file.url)
+                    .filter(|p| runtime::file_exists(p))
+                {
                     if self.browser {
                         self.browser_effects
                             .push(BrowserEffect::OpenFile(path.clone()));
@@ -1106,7 +1110,7 @@ impl App {
                         return;
                     }
 
-                    match open::that_detached(path) {
+                    match runtime::open(path) {
                         Ok(_) => {
                             self.mark_read(&Action::File(file.clone()));
                             self.message("Opened file.", false);
@@ -1141,6 +1145,24 @@ impl App {
             None
         };
 
+        let label = match &action {
+            Action::Navigate(Location::Course(course)) => course.id.clone(),
+            Action::Navigate(location @ Location::Item(_, _, _)) => self
+                .nav
+                .current
+                .as_ref()
+                .and_then(|view| {
+                    if &view.location == location {
+                        Some(view.page.title.clone())
+                    } else {
+                        view.selected_entry().map(|entry| entry.title.clone())
+                    }
+                })
+                .unwrap_or_else(|| "Item".into()),
+            Action::Navigate(location) => location.label(),
+            _ => String::new(),
+        };
+        self.download_name = format!("{}.zip", crate::api::safe_filename(&label));
         self.downloading = true;
         self.message("", false);
         self.browser_files.clear();
@@ -1152,7 +1174,7 @@ impl App {
         let tx = self.tx.clone();
         let directory = self.download_dir.clone();
         let existing = self.opened.clone();
-        self.downloader = Some(tokio::spawn(async move {
+        self.downloader = Some(runtime::spawn(async move {
             let plan = match action {
                 Action::Navigate(location) => api.downloadables(&location).await,
                 Action::File(file) => course
@@ -1192,12 +1214,14 @@ impl App {
             let mut expired = false;
 
             for target in plan.files {
-                let result =
-                    if let Some(path) = existing.get(&target.file.url).filter(|p| p.exists()) {
-                        Ok(path.clone())
-                    } else {
-                        api.download(&target.file, &target.course, &directory).await
-                    };
+                let result = if let Some(path) = existing
+                    .get(&target.file.url)
+                    .filter(|p| runtime::file_exists(p))
+                {
+                    Ok(path.clone())
+                } else {
+                    api.download(&target.file, &target.course, &directory).await
+                };
 
                 let saved = match result {
                     Ok(path) => {
@@ -1314,8 +1338,8 @@ impl App {
         };
         let id = self.preview_id;
         let tx = self.tx.clone();
-        self.preview_task = Some(tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(120)).await;
+        self.preview_task = Some(runtime::spawn(async move {
+            runtime::time::sleep(Duration::from_millis(120)).await;
 
             let result = api.load(&location).await;
             let _ = tx.send((
@@ -2536,6 +2560,7 @@ impl App {
                     self.scroll_or_select(KeyCode::Up);
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
             _ => {}
         }
     }
@@ -2686,14 +2711,17 @@ fn hint_lines(hints: &[Hint], width: usize) -> Vec<Line<'static>> {
 
 const HELP: &str = "↑ / ↓ or j / k    Move / scroll focused pane\nEnter / → / l    Open selected item\n← / h / b        Back\n/                Filter; Enter finishes, Esc clears\nf                Jump: type a row label, then Enter to open\ngg / G           First / last\nTab              Switch text / files\nPgUp / PgDn      Scroll a page\nd                Download selected branch; focused text: all files here\nx                Cancel download\nr                Refresh\nL                Sign in\nCtrl-Home        Courses (from any screen)\n●                New since the previous fetched list; opening marks read locally\nq / Ctrl-C       Quit\n\nLogin\nTab / Shift-Tab / ↑↓   Change field\nEnter            Next field / sign in\n← / →            Move caret\nHome / End       Start / end of field\nDelete / Backspace   Delete at / before caret\nF2               New CAPTCHA\nF4               Enlarge CAPTCHA\nF5               Suggest code with local OCR\nF6               Save password in desktop keyring (desktop only)\nEsc              Cancel and clear password\nCtrl-C           Quit\n\nEsc / ? / F1     Close help";
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn run(session: PathBuf, download_dir: PathBuf) -> Result<()> {
     run_mode(session, download_dir, false).await
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn run_login(session: PathBuf, download_dir: PathBuf) -> Result<()> {
     run_mode(session, download_dir, true).await
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn run_mode(session: PathBuf, download_dir: PathBuf, force_login: bool) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut app = App::new(session, download_dir, tx)?;
@@ -2725,7 +2753,7 @@ async fn run_mode(session: PathBuf, download_dir: PathBuf, force_login: bool) ->
             terminal.draw(|f| app.draw(f))?;
 
             if !event::poll(Duration::from_millis(80))? {
-                tokio::task::yield_now().await;
+                runtime::task::yield_now().await;
                 continue;
             }
 
@@ -2876,8 +2904,16 @@ impl BrowserApp {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn completion(&mut self) {
         if let Some((generation, result)) = self.rx.recv().await {
+            self.app.complete(generation, result);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn poll(&mut self) {
+        while let Ok((generation, result)) = self.rx.try_recv() {
             self.app.complete(generation, result);
         }
     }
@@ -2998,6 +3034,7 @@ impl BrowserApp {
             kind,
             column: x,
             row: y,
+            #[cfg(not(target_arch = "wasm32"))]
             modifiers: KeyModifiers::NONE,
         });
     }
@@ -3101,7 +3138,13 @@ impl BrowserApp {
                 .login_screen
                 .then(|| self.app.login_fields.username.clone()),
             error: self.app.status_error,
-            opens_browser: !self.app.text_focus
+            opens_browser: !self.app.login_screen
+                && !self.app.help
+                && !self.app.searching
+                && self.app.jump.is_none()
+                && !self.app.pending_g
+                && !self.app.busy
+                && !self.app.text_focus
                 && self
                     .app
                     .nav
